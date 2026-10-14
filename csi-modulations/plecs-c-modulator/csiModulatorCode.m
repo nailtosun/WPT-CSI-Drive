@@ -1,0 +1,164 @@
+function [decl, start, outp, upd] = csiModulatorCode()
+%CSIMODULATORCODE  C code of the PLECS C-Script "CSI modulator" for the two-level CSI.
+% The PLECS model generators that insert it (make_CSI_PLECS_models.m,
+% make_CSI_220krpm_PLECS_models.m) are in the CSI-Analytical-Calculations
+% repository; write_cscript_file.m writes the code to a plain .c file.
+%
+% C-Script interface:
+%   inputs     theta (angle of the current reference, i_a* = M cos(theta)), M
+%   outputs    G1..G6 = S_ap, S_bp, S_cp (rail P), S_an, S_bn, S_cn (rail N)
+%   parameters 1/f_sw, mod_method, eps_r, N_r, t_min, n_upd
+%   sample time [0, 0; 1/(f_sw*max(n_upd, 1)), 0], 10 zero-crossing signals
+%
+% Methods (mod_method), sequences as in csiGatesConventional.m (0-2) and
+% csiGatesBigan.m (3-6):
+%   0 NSPWM     [Sout Sk Sn Sk Sout]
+%   1 FSM       [Zx Sk Sn Zx]
+%   2 CSVM      [Z0a Sk Sn Z0b Sn Sk Z0a]      (Z0a = Zk outer, Z0b = Zx inner)
+%   3 CSVM-A    [Zk Sk Sn Z Sn Sk Zk], Z = Zx / Zn in even / odd periods
+%   4 3Z-SVM    [Zk Sk Zx Sn Zn Sn Zx Sk Zk]
+%   5 FSM-R     FSM, [Zx Sk Zk Sk Sn Zn Sn Zx] in every N_r-th period
+%   6 NSPWM-R   NSPWM, [Z1 Sout Sk Sn Z2 Sn Sk Sout] in every N_r-th period
+% Zx shorts the phase common to Sk and Sn, Zk / Zn the other phase of Sk / Sn.
+%
+% The references are sampled n_upd times per switching period (0 = continuously)
+% and the vector sequence of the period is rebuilt from them; zero-crossing
+% signals make the solver stop at every slot boundary. Slots shorter than
+% t_min are given to a neighbouring slot; a pulse that the period boundary
+% splits in two is judged by its whole width.
+    decl = ["#include <math.h>"
+            "#include <float.h>"
+            ""
+            "#define theta    Input(0)                   /* angle of the current reference, i_a* = M cos(theta) */"
+            "#define Mi       Input(1)                   /* modulation index */"
+            ""
+            "/* block parameters, copied in the start function (the helper functions cannot read them) */"
+            "static double TS;              /* switching period */"
+            "static int    METHOD;          /* 0 NSPWM, 1 FSM, 2 CSVM, 3 CSVM-A, 4 3Z-SVM, 5 FSM-R, 6 NSPWM-R */"
+            "static double EPS_R;           /* refresh pulse width / TS */"
+            "static int    N_R;             /* refresh pulses in every N_R-th period */"
+            "static double TMIN;            /* shortest slot */"
+            "static int    N_UPD;           /* reference updates per switching period, 0 = continuous */"
+            "static double thH, mH;         /* references as last sampled */"
+            ""
+            "#define NZC      10                         /* number of zero-crossing signals */"
+            "#define PI       3.14159265358979323846"
+            ""
+            "/* vectors 1..6 are active, 7..9 short phase a, b, c; phases 0 = a, 1 = b, 2 = c */"
+            "static const int TOPP[10] = {0, 0, 1, 1, 2, 2, 0, 0, 1, 2};"
+            "static const int BOTP[10] = {0, 2, 2, 0, 0, 1, 1, 0, 1, 2};"
+            "static const int ZX[7]    = {0, 7, 9, 8, 7, 9, 8};   /* zero vector of the common phase, sector 1..6 */"
+            "static const int Z0A[7]   = {0, 8, 7, 9, 8, 7, 9};   /* CSVM outer zero vector Zk, next to Sk */"
+            "static const int Z0B[7]   = {0, 7, 9, 8, 7, 9, 8};   /* CSVM inner zero vector Zx */"
+            ""
+            "static int    seqV[12];        /* vector of each slot */"
+            "static double eEnd[12];        /* end of each slot as a fraction of the period */"
+            "static int    nSlot;"
+            "static double acc;"
+            ""
+            "/* append a slot of duration d (in periods); slots shorter than tmin go to a neighbour */"
+            "static void addSlotT(int v, double d, double tmin)"
+            "{"
+            "  acc += d;"
+            "  if (nSlot > 0 && (d*TS < tmin || seqV[nSlot-1] == v)) { eEnd[nSlot-1] = acc; return; }"
+            "  if (d*TS < tmin) return;"
+            "  seqV[nSlot] = v;  eEnd[nSlot] = acc;  nSlot++;"
+            "}"
+            "#define addSlot(v, d) addSlotT(v, d, TMIN)"
+            "/* half of a pulse that the period boundary splits: its other half is in the neighbouring period */"
+            "#define addHalf(v, d) addSlotT(v, d, TMIN/2)"
+            ""
+            "/* phase that two vectors have in common */"
+            "static int shared(int v1, int v2) { return (TOPP[v1] == TOPP[v2]) ? TOPP[v1] : BOTP[v1]; }"
+            ""
+            "/* vector sequence of the switching period k for the reference angle th and the modulation index m */"
+            "static void buildSequence(double th, double m, long k)"
+            "{"
+            "  double x, dk, dn, d0, e, z;"
+            "  int s, Sk, Sn, so, Zx, Zk, Zn, Zi, Z1, Z2;"
+            "  int refresh = (N_R <= 1) || (k % N_R == 0);"
+            ""
+            "  acc = 0;  nSlot = 0;"
+            "  th = fmod(th, 2*PI);  if (th < 0) th += 2*PI;"
+            ""
+            "  if (METHOD == 0 || METHOD == 6) {"
+            "    /* NSPWM: sectors of 60 deg that start at theta = 0, x counted from the end of the sector */"
+            "    s = (int)floor(th/(PI/3));  if (s > 5) s = 5;"
+            "    x = (s + 1)*PI/3 - th;"
+            "    dk = m*sin(PI/6 + x) + m*cos(x) - 1;  if (dk < 0) dk = 0;"
+            "    dn = 1 - m*cos(x);                    if (dn < 0) dn = 0;"
+            "    d0 = 1 - dk - dn;                     /* outer active vector */"
+            "    so = (s + 1) % 6 + 1;  Sk = s + 1;  Sn = (s + 5) % 6 + 1;"
+            "    if (METHOD == 6 && refresh) {"
+            "      /* z of Sout and z of Sn are replaced by z of Sk and z of zero vector */"
+            "      z = 2*EPS_R;  if (z > d0/2) z = d0/2;  if (z > dn/2) z = dn/2;"
+            "      Z1 = 7 + shared(so, Sk);  Z2 = 7 + shared(Sk, Sn);"
+            "      addSlot(Z1, z/2);  addSlot(so, (d0 - z)/2);  addSlot(Sk, (dk + z)/2);  addSlot(Sn, (dn - z)/2);"
+            "      addSlot(Z2, z/2);  addSlot(Sn, (dn - z)/2);  addSlot(Sk, (dk + z)/2);  addSlot(so, (d0 - z)/2);"
+            "    } else {"
+            "      addSlot(so, d0/2);  addSlot(Sk, dk/2);  addSlot(Sn, dn);  addSlot(Sk, dk/2);  addSlot(so, d0/2);"
+            "    }"
+            "  } else {"
+            "    /* space-vector sectors centred on the current crests, x counted from the start of the sector */"
+            "    x = fmod(th + PI/6, 2*PI);"
+            "    s = (int)floor(x/(PI/3)) + 1;  if (s > 6) s = 6;"
+            "    x -= (s - 1)*PI/3;"
+            "    dk = m*sin(PI/3 - x);  dn = m*sin(x);  d0 = 1 - dk - dn;"
+            "    if (d0 < 0) { e = dk + dn;  dk /= e;  dn /= e;  d0 = 0; }"
+            "    Sk = (s + 4) % 6 + 1;  Sn = s;  Zx = ZX[s];"
+            "    Zk = 7 + TOPP[Sk] + BOTP[Sk] - (Zx - 7);       /* shorts the other phase of Sk */"
+            "    Zn = 7 + TOPP[Sn] + BOTP[Sn] - (Zx - 7);       /* shorts the other phase of Sn */"
+            "    switch (METHOD) {"
+            "    case 2:                                         /* CSVM */"
+            "      addHalf(Z0A[s], d0/4);  addSlot(Sk, dk/2);  addSlot(Sn, dn/2);  addSlot(Z0B[s], d0/2);"
+            "      addSlot(Sn, dn/2);  addSlot(Sk, dk/2);  addHalf(Z0A[s], d0/4);"
+            "      break;"
+            "    case 3:                                         /* CSVM-A */"
+            "      Zi = (k % 2 == 0) ? Zx : Zn;"
+            "      addHalf(Zk, d0/4);  addSlot(Sk, dk/2);  addSlot(Sn, dn/2);  addSlot(Zi, d0/2);"
+            "      addSlot(Sn, dn/2);  addSlot(Sk, dk/2);  addHalf(Zk, d0/4);"
+            "      break;"
+            "    case 4:                                         /* 3Z-SVM */"
+            "      addHalf(Zk, d0/8);  addSlot(Sk, dk/2);  addSlot(Zx, d0/4);  addSlot(Sn, dn/2);  addSlot(Zn, d0/4);"
+            "      addSlot(Sn, dn/2);  addSlot(Zx, d0/4);  addSlot(Sk, dk/2);  addHalf(Zk, d0/8);"
+            "      break;"
+            "    case 5:                                         /* FSM-R */"
+            "      if (refresh) {"
+            "        e = EPS_R;  if (e > d0/4) e = d0/4;"
+            "        addSlot(Zx, d0/2 - e);  addSlot(Sk, dk/2);  addSlot(Zk, e);  addSlot(Sk, dk/2);"
+            "        addSlot(Sn, dn/2);  addSlot(Zn, e);  addSlot(Sn, dn/2);  addSlot(Zx, d0/2 - e);"
+            "        break;"
+            "      }"
+            "      /* no refresh in this period: FSM */"
+            "    default:                                        /* FSM */"
+            "      addSlot(Zx, d0/2);  addSlot(Sk, dk);  addSlot(Sn, dn);  addSlot(Zx, d0/2);"
+            "    }"
+            "  }"
+            "  if (nSlot == 0) { seqV[0] = 7;  eEnd[0] = 1;  nSlot = 1; }"
+            "}"];
+    start = ["TS     = ParamRealData(0, 0);"
+             "METHOD = (int)ParamRealData(1, 0);"
+             "EPS_R  = ParamRealData(2, 0);"
+             "N_R    = (int)ParamRealData(3, 0);"
+             "TMIN   = ParamRealData(4, 0);"
+             "N_UPD  = (int)ParamRealData(5, 0);"];
+    outp = ["double p   = CurrentTime/TS;"
+            "long   k   = (long)floor(p + 1e-9);   /* switching period */"
+            "double tau = p - k;                    /* position inside the period, 0..1 */"
+            "int    slot = 0, v, i;"
+            ""
+            "if (tau < 0) tau = 0;"
+            "/* the references are sampled N_UPD times per period (0: continuously, like a carrier comparison) */"
+            "if (N_UPD <= 0 || IsSampleHit(1)) { thH = theta;  mH = Mi; }"
+            "buildSequence(thH, mH, k);"
+            "for (i = 0; i < nSlot - 1; i++) if (tau >= eEnd[i]) slot = i + 1;"
+            ""
+            "v = seqV[slot];"
+            "for (i = 0; i < 3; i++) {"
+            "  Output(i)     = (TOPP[v] == i);    /* G1..G3: S_ap, S_bp, S_cp */"
+            "  Output(3 + i) = (BOTP[v] == i);    /* G4..G6: S_an, S_bn, S_cn */"
+            "}"
+            "/* the solver stops at every slot boundary */"
+            "for (i = 0; i < NZC; i++) ZCSignal(i) = (i < nSlot - 1) ? tau - eEnd[i] : 1.0;"];
+    upd = "";
+end
